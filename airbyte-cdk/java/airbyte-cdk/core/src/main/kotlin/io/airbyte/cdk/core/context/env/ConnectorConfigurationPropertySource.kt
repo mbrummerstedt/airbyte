@@ -30,6 +30,7 @@ private val logger = KotlinLogging.logger {}
  * file path argument, if present.</li> <li><b>airbyte.connector.state</b> - the Airbyte connector
  * state as JSON read from the state file path argument, if present.</li> </ol>
  */
+@Suppress("UNCHECKED_CAST")
 class ConnectorConfigurationPropertySource(commandLine: CommandLine) :
     MapPropertySource("connector", resolveValues(commandLine)) {
     companion object {

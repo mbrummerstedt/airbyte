@@ -9,19 +9,32 @@ import static io.airbyte.cdk.integrations.destination.jdbc.AbstractJdbcDestinati
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.base.Preconditions;
+import io.airbyte.cdk.core.command.option.AirbyteConfiguredCatalog;
+import io.airbyte.cdk.core.command.option.ConnectorConfiguration;
 import io.airbyte.cdk.db.jdbc.JdbcDatabase;
 import io.airbyte.cdk.db.jdbc.JdbcUtils;
 import io.airbyte.cdk.integrations.base.SerializedAirbyteMessageConsumer;
 import io.airbyte.cdk.integrations.base.TypingAndDedupingFlag;
 import io.airbyte.cdk.integrations.destination.NamingConventionTransformer;
 import io.airbyte.cdk.integrations.destination.StreamSyncSummary;
+import io.airbyte.cdk.integrations.destination.async.AirbyteFileUtils;
 import io.airbyte.cdk.integrations.destination.async.AsyncStreamConsumer;
-import io.airbyte.cdk.integrations.destination.async.buffers.BufferManager;
+import io.airbyte.cdk.integrations.destination.async.DetectStreamToFlush;
+import io.airbyte.cdk.integrations.destination.async.FlushWorkers;
+import io.airbyte.cdk.integrations.destination.async.GlobalMemoryManager;
+import io.airbyte.cdk.integrations.destination.async.RunningFlushWorkers;
+import io.airbyte.cdk.integrations.destination.async.StreamDescriptorUtils;
+import io.airbyte.cdk.integrations.destination.async.buffers.AsyncBuffers;
+import io.airbyte.cdk.integrations.destination.async.buffers.BufferDequeue;
+import io.airbyte.cdk.integrations.destination.async.buffers.BufferEnqueue;
+import io.airbyte.cdk.integrations.destination.async.buffers.BufferMemory;
 import io.airbyte.cdk.integrations.destination.async.deser.DeserializationUtil;
 import io.airbyte.cdk.integrations.destination.async.deser.IdentityDataTransformer;
 import io.airbyte.cdk.integrations.destination.async.deser.StreamAwareDataTransformer;
-import io.airbyte.cdk.integrations.destination.async.partial_messages.PartialAirbyteMessage;
+import io.airbyte.cdk.integrations.destination.async.function.DestinationFlushFunction;
+import io.airbyte.cdk.integrations.destination.async.model.PartialAirbyteMessage;
 import io.airbyte.cdk.integrations.destination.async.state.FlushFailure;
+import io.airbyte.cdk.integrations.destination.async.state.GlobalAsyncStateManager;
 import io.airbyte.cdk.integrations.destination.buffered_stream_consumer.BufferedStreamConsumer;
 import io.airbyte.cdk.integrations.destination.buffered_stream_consumer.OnCloseFunction;
 import io.airbyte.cdk.integrations.destination.buffered_stream_consumer.OnStartFunction;
@@ -37,15 +50,19 @@ import io.airbyte.protocol.models.v0.ConfiguredAirbyteCatalog;
 import io.airbyte.protocol.models.v0.ConfiguredAirbyteStream;
 import io.airbyte.protocol.models.v0.DestinationSyncMode;
 import io.airbyte.protocol.models.v0.StreamDescriptor;
+import io.micronaut.scheduling.ScheduledExecutorTaskScheduler;
+import io.micronaut.scheduling.instrument.InstrumentedExecutorService;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -77,30 +94,79 @@ public class JdbcBufferedConsumerFactory {
                                                              final TyperDeduper typerDeduper,
                                                              final StreamAwareDataTransformer dataTransformer) {
     final List<WriteConfig> writeConfigs = createWriteConfigs(namingResolver, config, catalog, sqlOperations.isSchemaRequired());
-    return new AsyncStreamConsumer(
+
+    final AsyncBuffers asyncBuffers = new AsyncBuffers();
+    final BufferMemory bufferMemory = new BufferMemory() {
+
+      @Override
+      public long getMemoryLimit() {
+        return ((long) (Runtime.getRuntime().maxMemory() * 0.2));
+      }
+
+    };
+    final GlobalMemoryManager memoryManager = new GlobalMemoryManager(bufferMemory);
+    final GlobalAsyncStateManager stateManager = new GlobalAsyncStateManager(memoryManager);
+    final BufferEnqueue bufferEnqueue = new BufferEnqueue(memoryManager, stateManager, asyncBuffers);
+    final BufferDequeue bufferDequeue = new BufferDequeue(memoryManager, stateManager, asyncBuffers);
+    final RunningFlushWorkers runningFlushWorkers = new RunningFlushWorkers();
+    final DestinationFlushFunction destinationFlushFunction =
+        new JdbcInsertFlushFunction(recordWriterFunction(database, sqlOperations, writeConfigs, catalog));
+    final AirbyteFileUtils airbyteFileUtils = new AirbyteFileUtils();
+    final DetectStreamToFlush detectStreamToFlush = new DetectStreamToFlush(
+        bufferDequeue,
+        runningFlushWorkers,
+        destinationFlushFunction,
+        airbyteFileUtils,
+        Optional.empty());
+    final ExecutorService workerPool = (InstrumentedExecutorService) () -> Executors.newScheduledThreadPool(2);
+    final FlushFailure flushFailure = new FlushFailure();
+    final FlushWorkers flushWorkers = new FlushWorkers(
+        stateManager,
+        bufferDequeue,
+        destinationFlushFunction,
         outputRecordCollector,
+        workerPool,
+        new ScheduledExecutorTaskScheduler(Executors.newScheduledThreadPool(2)),
+        detectStreamToFlush,
+        runningFlushWorkers,
+        flushFailure,
+        airbyteFileUtils);
+    final ConnectorConfiguration configuration = new ConnectorConfiguration() {
+
+      @NotNull
+      @Override
+      public Optional<String> getDefaultNamespace() {
+        return Optional.of(defaultNamespace);
+      }
+
+      @NotNull
+      @Override
+      public Optional<String> getRawNamespace() {
+        return Optional.empty();
+      }
+
+    };
+    final AirbyteConfiguredCatalog airbyteConfiguredCatalog = new AirbyteConfiguredCatalog() {
+
+      @NotNull
+      @Override
+      public ConfiguredAirbyteCatalog getConfiguredCatalog() {
+        return catalog;
+      }
+
+    };
+
+    return new AsyncStreamConsumer(
         onStartFunction(database, sqlOperations, writeConfigs, typerDeduper),
         onCloseFunction(typerDeduper),
-        new JdbcInsertFlushFunction(recordWriterFunction(database, sqlOperations, writeConfigs, catalog)),
-        catalog,
-        new BufferManager((long) (Runtime.getRuntime().maxMemory() * 0.2)),
-        new FlushFailure(),
-        Optional.ofNullable(defaultNamespace),
-        Executors.newFixedThreadPool(2),
-        dataTransformer,
-        new DeserializationUtil());
-  }
-
-  public static SerializedAirbyteMessageConsumer createAsync(final Consumer<AirbyteMessage> outputRecordCollector,
-                                                             final JdbcDatabase database,
-                                                             final SqlOperations sqlOperations,
-                                                             final NamingConventionTransformer namingResolver,
-                                                             final JsonNode config,
-                                                             final ConfiguredAirbyteCatalog catalog,
-                                                             final String defaultNamespace,
-                                                             final TyperDeduper typerDeduper) {
-    return createAsync(outputRecordCollector, database, sqlOperations, namingResolver, config, catalog, defaultNamespace, typerDeduper,
-        new IdentityDataTransformer());
+        configuration,
+        airbyteConfiguredCatalog,
+        bufferEnqueue,
+        flushWorkers,
+        flushFailure,
+        new IdentityDataTransformer(),
+        new DeserializationUtil(),
+        new StreamDescriptorUtils());
   }
 
   private static List<WriteConfig> createWriteConfigs(final NamingConventionTransformer namingResolver,

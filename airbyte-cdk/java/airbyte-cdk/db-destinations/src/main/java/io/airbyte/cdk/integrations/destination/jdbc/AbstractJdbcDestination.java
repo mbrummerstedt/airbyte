@@ -23,8 +23,8 @@ import io.airbyte.cdk.integrations.base.TypingAndDedupingFlag;
 import io.airbyte.cdk.integrations.destination.NamingConventionTransformer;
 import io.airbyte.cdk.integrations.destination.async.deser.IdentityDataTransformer;
 import io.airbyte.cdk.integrations.destination.async.deser.StreamAwareDataTransformer;
-import io.airbyte.cdk.integrations.destination.async.partial_messages.PartialAirbyteMessage;
-import io.airbyte.cdk.integrations.destination.async.partial_messages.PartialAirbyteRecordMessage;
+import io.airbyte.cdk.integrations.destination.async.model.PartialAirbyteMessage;
+import io.airbyte.cdk.integrations.destination.async.model.PartialAirbyteRecordMessage;
 import io.airbyte.cdk.integrations.destination.jdbc.typing_deduping.JdbcDestinationHandler;
 import io.airbyte.cdk.integrations.destination.jdbc.typing_deduping.JdbcSqlGenerator;
 import io.airbyte.cdk.integrations.destination.jdbc.typing_deduping.JdbcV1V2Migrator;
@@ -313,7 +313,8 @@ public abstract class AbstractJdbcDestination<DestinationState extends MinimumDe
           config,
           catalog,
           null,
-          new NoopTyperDeduper());
+          new NoopTyperDeduper(),
+          new IdentityDataTransformer());
     }
 
     final String defaultNamespace = config.get(getConfigSchemaKey()).asText();

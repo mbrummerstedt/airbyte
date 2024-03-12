@@ -4,19 +4,33 @@
 
 package io.airbyte.cdk.integrations.destination.staging;
 
-import static io.airbyte.cdk.integrations.destination.async.buffers.BufferManager.MEMORY_LIMIT_RATIO;
+import static io.airbyte.cdk.integrations.destination.async.buffers.BufferMemory.MEMORY_LIMIT_RATIO;
 import static java.util.stream.Collectors.joining;
 import static java.util.stream.Collectors.toList;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.base.Preconditions;
+import io.airbyte.cdk.core.command.option.AirbyteConfiguredCatalog;
+import io.airbyte.cdk.core.command.option.ConnectorConfiguration;
 import io.airbyte.cdk.db.jdbc.JdbcDatabase;
 import io.airbyte.cdk.integrations.base.SerializedAirbyteMessageConsumer;
 import io.airbyte.cdk.integrations.destination.NamingConventionTransformer;
+import io.airbyte.cdk.integrations.destination.async.AirbyteFileUtils;
 import io.airbyte.cdk.integrations.destination.async.AsyncStreamConsumer;
-import io.airbyte.cdk.integrations.destination.async.buffers.BufferManager;
+import io.airbyte.cdk.integrations.destination.async.DetectStreamToFlush;
+import io.airbyte.cdk.integrations.destination.async.FlushWorkers;
+import io.airbyte.cdk.integrations.destination.async.GlobalMemoryManager;
+import io.airbyte.cdk.integrations.destination.async.RunningFlushWorkers;
+import io.airbyte.cdk.integrations.destination.async.StreamDescriptorUtils;
+import io.airbyte.cdk.integrations.destination.async.buffers.AsyncBuffers;
+import io.airbyte.cdk.integrations.destination.async.buffers.BufferDequeue;
+import io.airbyte.cdk.integrations.destination.async.buffers.BufferEnqueue;
+import io.airbyte.cdk.integrations.destination.async.buffers.BufferMemory;
+import io.airbyte.cdk.integrations.destination.async.deser.DeserializationUtil;
 import io.airbyte.cdk.integrations.destination.async.deser.IdentityDataTransformer;
 import io.airbyte.cdk.integrations.destination.async.deser.StreamAwareDataTransformer;
+import io.airbyte.cdk.integrations.destination.async.state.FlushFailure;
+import io.airbyte.cdk.integrations.destination.async.state.GlobalAsyncStateManager;
 import io.airbyte.cdk.integrations.destination.jdbc.WriteConfig;
 import io.airbyte.commons.exceptions.ConfigErrorException;
 import io.airbyte.integrations.base.destination.typing_deduping.ParsedCatalog;
@@ -29,6 +43,8 @@ import io.airbyte.protocol.models.v0.ConfiguredAirbyteCatalog;
 import io.airbyte.protocol.models.v0.ConfiguredAirbyteStream;
 import io.airbyte.protocol.models.v0.DestinationSyncMode;
 import io.airbyte.protocol.models.v0.StreamDescriptor;
+import io.micronaut.scheduling.ScheduledExecutorTaskScheduler;
+import io.micronaut.scheduling.instrument.InstrumentedExecutorService;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -36,8 +52,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -206,8 +225,67 @@ public class StagingConsumerFactory extends SerialStagingConsumerFactory {
         typerDeduper,
         optimalBatchSizeBytes,
         useDestinationsV2Columns);
-    return new AsyncStreamConsumer(
+
+    final AsyncBuffers asyncBuffers = new AsyncBuffers();
+    final BufferMemory bufferMemory = new BufferMemory() {
+
+      @Override
+      public long getMemoryLimit() {
+        return StagingConsumerFactory.getMemoryLimit(bufferMemoryLimit);
+      }
+
+    };
+    final GlobalMemoryManager memoryManager = new GlobalMemoryManager(bufferMemory);
+    final GlobalAsyncStateManager stateManager = new GlobalAsyncStateManager(memoryManager);
+    final BufferEnqueue bufferEnqueue = new BufferEnqueue(memoryManager, stateManager, asyncBuffers);
+    final BufferDequeue bufferDequeue = new BufferDequeue(memoryManager, stateManager, asyncBuffers);
+    final RunningFlushWorkers runningFlushWorkers = new RunningFlushWorkers();
+    final AirbyteFileUtils airbyteFileUtils = new AirbyteFileUtils();
+    final DetectStreamToFlush detectStreamToFlush = new DetectStreamToFlush(
+        bufferDequeue,
+        runningFlushWorkers,
+        flusher,
+        airbyteFileUtils,
+        Optional.empty());
+    final ExecutorService workerPool = (InstrumentedExecutorService) () -> Executors.newFixedThreadPool(5);
+    final FlushFailure flushFailure = new FlushFailure();
+    final FlushWorkers flushWorkers = new FlushWorkers(
+        stateManager,
+        bufferDequeue,
+        flusher,
         outputRecordCollector,
+        workerPool,
+        new ScheduledExecutorTaskScheduler(Executors.newScheduledThreadPool(2)),
+        detectStreamToFlush,
+        runningFlushWorkers,
+        flushFailure,
+        airbyteFileUtils);
+    final ConnectorConfiguration configuration = new ConnectorConfiguration() {
+
+      @NotNull
+      @Override
+      public Optional<String> getDefaultNamespace() {
+        return Optional.of(defaultNamespace);
+      }
+
+      @NotNull
+      @Override
+      public Optional<String> getRawNamespace() {
+        return Optional.empty();
+      }
+
+    };
+    final AirbyteConfiguredCatalog airbyteConfiguredCatalog = new AirbyteConfiguredCatalog() {
+
+      @NotNull
+      @Override
+      public ConfiguredAirbyteCatalog getConfiguredCatalog() {
+        return catalog;
+      }
+
+    };
+
+    return new AsyncStreamConsumer(
         GeneralStagingFunctions.onStartFunction(database, stagingOperations, writeConfigs, typerDeduper),
         // todo (cgardens) - wrapping the old close function to avoid more code churn.
         (hasFailed, streamSyncSummaries) -> {
@@ -222,11 +300,14 @@ public class StagingConsumerFactory extends SerialStagingConsumerFactory {
             throw new RuntimeException(e);
           }
         },
-        flusher,
-        catalog,
-        new BufferManager(getMemoryLimit(bufferMemoryLimit)),
-        Optional.ofNullable(defaultNamespace),
-        dataTransformer);
+        configuration,
+        airbyteConfiguredCatalog,
+        bufferEnqueue,
+        flushWorkers,
+        flushFailure,
+        new IdentityDataTransformer(),
+        new DeserializationUtil(),
+        new StreamDescriptorUtils());
   }
 
   private static long getMemoryLimit(final Optional<Long> bufferMemoryLimit) {
