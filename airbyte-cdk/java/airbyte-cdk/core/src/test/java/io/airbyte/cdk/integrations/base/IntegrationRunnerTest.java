@@ -6,8 +6,6 @@ package io.airbyte.cdk.integrations.base;
 
 import static io.airbyte.cdk.integrations.base.IntegrationRunner.ORPHANED_THREAD_FILTER;
 import static io.airbyte.cdk.integrations.util.ConnectorExceptionUtil.COMMON_EXCEPTION_MESSAGE_TEMPLATE;
-import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
-import static org.assertj.core.api.AssertionsForClassTypes.catchThrowable;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -244,9 +242,11 @@ class IntegrationRunnerTest {
     when(expectedConnSpec.getConnectionSpecification()).thenReturn(CONFIG);
 
     final JsonSchemaValidator jsonSchemaValidator = mock(JsonSchemaValidator.class);
-    final Throwable throwable = catchThrowable(() -> new IntegrationRunner(cliParser, stdoutConsumer, null, source, jsonSchemaValidator).run(ARGS));
 
-    assertThat(throwable).isInstanceOf(ConfigErrorException.class);
+    assertThrows(ConfigErrorException.class, () -> {
+      new IntegrationRunner(cliParser, stdoutConsumer, null, source, jsonSchemaValidator).run(ARGS);
+    });
+
     // noinspection resource
     verify(source).read(CONFIG, CONFIGURED_CATALOG, STATE);
   }
